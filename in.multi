@@ -1,0 +1,354 @@
+# ===============================================================================
+# LAMMPS Script: Multimaterial Friction Stir Spot Welding (FSSW)
+# DISSIMILAR LAP JOINT: Al (bottom plate) + Cu (top plate) + W Tool
+#
+# WHY MULTIMATERIAL:
+#   Bottom plate = Aluminum (FCC, a=4.05 Å, mass=26.98)
+#   Top plate    = Copper   (FCC, a=3.615 Å, mass=63.55)
+#   Tool         = Tungsten (BCC, a=3.16  Å, mass=183.84)
+#   Potential    = CuAlW EAM/alloy — ALL THREE elements parameterized
+#
+# GEOMETRY (all Angstroms; 1 mm = 10 Å):
+#   Bottom Al plate:  z =   0 to  50 Å  (5 mm)
+#   Top Cu plate:     z =  50 to 100 Å  (5 mm)
+#   Faying surface:   z =  50 Å  (Al-Cu interface — the key dissimilar joint)
+#   Top surface:      z = 100 Å
+#
+# TOOL (W, starts 10 Å above top surface):
+#   Shoulder: r=120 Å, z=110–120 Å → plunges to z=100–110 (touches Cu surface)
+#   Pin:      r= 40 Å, z= 45–110 Å → plunges to z= 35– 100 (penetrates into Al)
+#   Pin length: 65 Å = 6.5 mm (crosses faying surface into bottom Al plate)
+#
+# ATOM TYPES:
+#   type 1 = Al  (bottom plate)
+#   type 2 = Cu  (top plate)
+#   type 3 = W   (tool)
+#
+# KEY DIFFERENCES FROM Al-Al VERSION:
+#   - Top plate uses Cu lattice (a=3.615 Å, NOT 4.05 Å)
+#   - Masses updated: type2 = 63.55 (Cu)
+#   - pair_coeff maps: Al Cu W  (all three from CuAlW.txt)
+#   - Overlap threshold tightened to 2.0 Å (Cu nn=2.556 Å < Al nn=2.863 Å)
+#   - Separate temperature computes for Al and Cu plates
+#   - Separate NVT fixes for Al and Cu during equilibration
+#     (different masses → different thermal equilibration rates)
+#   - dump element labels updated: Al Cu W
+#
+# THERMO: every 100 steps
+# DUMP:   every 100 steps diagnostic, every 500 steps production
+# ===============================================================================
+
+
+# ------------------- 1) BASIC SETUP -------------------
+units          metal
+boundary       p p s
+dimension      3
+atom_style     atomic
+
+neighbor       2.5 bin
+neigh_modify   delay 0 every 1 check yes one 10000
+
+
+# ------------------- 2) SIMULATION BOX -------------------
+# 3 atom types: Al, Cu, W
+region         box block 0 200 0 200 0 130 units box
+create_box     3 box
+
+
+# ------------------- 3) BOTTOM PLATE — Al (z = 0 to 50 Å) -------------------
+region         bottom_plate block 0 200 0 200 0 50 units box
+lattice        fcc 4.05 orient x 1 0 0 orient y 0 1 0 orient z 0 0 1
+create_atoms   1 region bottom_plate
+
+
+# ------------------- 4) TOP PLATE — Cu (z = 50 to 100 Å) -------------------
+# Cu has a different lattice constant (3.615 Å vs Al 4.05 Å)
+# Shift origin by 0.5 in z to avoid atom overlap at faying surface z=50
+region         top_plate block 0 200 0 200 50 100 units box
+lattice        fcc 3.615 origin 0.0 0.0 0.5
+create_atoms   2 region top_plate
+
+
+# ------------------- 5) TOOL GEOMETRY — W -------------------
+variable       cx equal 100.0
+variable       cy equal 100.0
+
+# Shoulder: full cylinder z=110–120 Å, r=0–120 Å
+region         tool_shoulder cylinder z ${cx} ${cy} 120.0 110 120 units box
+
+# Pin: z=45–110 Å, r=0–40 Å  (will cross the Al-Cu faying surface)
+region         tool_pin      cylinder z ${cx} ${cy}  40.0  45 110 units box
+
+# Full tool = shoulder union pin
+region         tool_total    union 2 tool_shoulder tool_pin
+
+lattice        bcc 3.16
+create_atoms   3 region tool_total
+
+write_dump     all xyz step0_with_tool.xyz modify element Al Cu W
+
+
+# ------------------- 6) MASSES & POTENTIAL -------------------
+mass           1  26.98    # Al
+mass           2  63.55    # Cu  ← KEY CHANGE from Al-Al version
+mass           3 183.84    # W
+
+pair_style     eam/alloy
+# CuAlW.txt must contain Cu, Al, and W parameterization.
+# Mapping: type1=Al, type2=Cu, type3=W
+# This is now a TRUE 3-element simulation — all cross-interactions are active:
+#   Al-Al, Cu-Cu, W-W, Al-Cu, Al-W, Cu-W
+pair_coeff     * * CuAlW.txt Al Cu W
+
+
+# ------------------- 7) REMOVE OVERLAPS -------------------
+# Use 2.0 Å threshold: Cu FCC nn = 2.556 Å, Al FCC nn = 2.863 Å
+# 2.0 Å safely catches faying-surface overlaps without deleting valid atoms
+delete_atoms   overlap 2.0 all all
+
+write_dump     all xyz step1_overlap_removed.xyz modify element Al Cu W
+
+
+# ------------------- 8) GROUPS -------------------
+# Defined AFTER delete_atoms for accurate membership
+
+group          Al_plate   type 1
+group          Cu_plate   type 2
+group          Workpiece  type 1 2    # all workpiece atoms
+group          Tool       type 3
+
+# Fixed anvil: bottom 3 Å of Al plate
+region         clamp_region block 0 200 0 200 0 3 units box
+group          clamped      region clamp_region
+
+# Mobile workpiece: everything except the clamped base
+group          mobile_work  subtract Workpiece clamped
+
+# Thermostat subgroups (separate for Al and Cu — different mass, different Tdamp)
+group          thermo_Al    subtract Al_plate clamped
+group          thermo_Cu    type 2                      # Cu plate has no clamped atoms
+
+# Combined thermostat group (used in production phases)
+group          thermo_group union thermo_Al thermo_Cu
+
+# Faying surface monitoring: Al-Cu interface ±5 Å
+region         faying_region block 0 200 0 200 45 55 units box
+group          faying_atoms  region faying_region
+
+# Faying subgroups to track mixing of Al and Cu at interface
+group          faying_Al    intersect faying_atoms Al_plate
+group          faying_Cu    intersect faying_atoms Cu_plate
+
+
+# ------------------- 9) COMPUTES -------------------
+compute        T_mobile   mobile_work  temp
+compute        T_Al       Al_plate     temp
+compute        T_Cu       Cu_plate     temp
+compute        T_faying   faying_atoms temp
+compute        T_fayAl    faying_Al    temp
+compute        T_fayCu    faying_Cu    temp
+
+
+# ------------------- 10) MINIMIZATION -------------------
+fix            hold_tool  Tool    setforce 0.0 0.0 0.0
+velocity       Tool       set     0.0 0.0 0.0
+fix            hold_clamp clamped setforce 0.0 0.0 0.0
+velocity       clamped    set     0.0 0.0 0.0
+
+min_style      cg
+minimize       1e-10 1e-8 10000 100000
+
+unfix          hold_tool
+unfix          hold_clamp
+
+write_dump     all xyz step2_minimized.xyz modify element Al Cu W
+
+# Energy sanity check before velocity initialization
+# Al cohesive energy ≈ -3.36 eV/atom, Cu ≈ -3.49 eV/atom
+# If pe/atom is positive or near zero → overlaps still present → DO NOT continue
+thermo_style   custom step pe ke etotal press
+thermo         1
+run            0
+print ">>> Sanity check: pe should be large negative. If near 0 or positive STOP. <<<"
+
+
+# ------------------- 11) EQUILIBRATION -------------------
+reset_timestep 0
+timestep       0.001    # 1 fs
+
+# Permanent constraints (active for entire simulation)
+fix            fix_clamp  clamped setforce 0.0 0.0 0.0
+velocity       clamped    set     0.0 0.0 0.0
+
+# Hold tool rigid during equilibration
+fix            fix_tool   Tool    setforce 0.0 0.0 0.0
+velocity       Tool       set     0.0 0.0 0.0
+
+# Initialize workpiece at low temperature to avoid velocity shock
+velocity       thermo_group create 50.0 482793 dist gaussian
+
+# Thermo: watch Al and Cu temperatures separately to confirm both equilibrate
+thermo_style   custom step temp c_T_mobile c_T_Al c_T_Cu c_T_faying pe ke etotal
+thermo         100
+thermo_modify  lost warn
+
+# Diagnostic dump (100-step frames during equilibration)
+dump           diag_dump all custom 100 diagnostic.lammpstrj &
+               id type x y z vx vy vz
+dump_modify    diag_dump element Al Cu W sort id
+
+# ------- Phase 1: Ramp 50 K → 300 K -------
+# Al (light) and Cu (heavy) have different thermal relaxation times.
+# Use separate NVT with matched Tdamp to equilibrate both correctly.
+# Tdamp=0.5 ps (large) for gentle ramp — avoids energy spikes.
+print ">>> EQUILIBRATION PHASE 1 (NVT ramp 50K→300K, Al and Cu separate) <<<"
+fix  eq_Al1 thermo_Al nvt temp 50.0 300.0 0.5
+fix  eq_Cu1 thermo_Cu nvt temp 50.0 300.0 0.5
+run  20000    # 20 ps
+unfix eq_Al1
+unfix eq_Cu1
+
+# ------- Phase 2: Hold at 300 K -------
+print ">>> EQUILIBRATION PHASE 2 (NVT hold 300K, tighter coupling) <<<"
+fix  eq_Al2 thermo_Al nvt temp 300.0 300.0 0.1
+fix  eq_Cu2 thermo_Cu nvt temp 300.0 300.0 0.1
+run  20000    # 20 ps
+unfix eq_Al2
+unfix eq_Cu2
+
+thermo_modify  lost error
+
+unfix          fix_tool
+write_dump     all xyz step3_equilibrated.xyz modify element Al Cu W
+
+
+# ------------------- 12) PLUNGE PHASE -------------------
+# Tool plunges DOWN 10 Å into Cu surface, pin crosses Al-Cu interface
+# Plunge velocity: -0.2 Å/ps (10 Å / 50 ps)
+# Rotation: -0.03 rad/ps (CW from above)
+
+reset_timestep 0
+
+undump         diag_dump
+dump           prod_dump all custom 500 fssw_AlCu_production.lammpstrj &
+               id type x y z vx vy vz
+dump_modify    prod_dump element Al Cu W sort id
+
+# Tool motion: rotation + plunge combined in one fix move
+variable  omega   equal -0.03    # rad/ps, CW
+variable  vplunge equal -0.2     # Å/ps, downward
+
+variable  vx_tool atom  -v_omega*(y-${cy})
+variable  vy_tool atom   v_omega*(x-${cx})
+variable  vz_tool atom   v_vplunge
+
+fix   tool_motion Tool move variable v_vx_tool v_vy_tool v_vz_tool NULL NULL NULL
+
+# Separate NVT for Al and Cu during plunge:
+# Cu (top) will heat faster (tool contacts Cu first)
+# Al (bottom) heats more slowly via conduction across faying surface
+fix   nvt_Al_plunge thermo_Al nvt temp 300.0 700.0 0.1
+fix   nvt_Cu_plunge thermo_Cu nvt temp 300.0 900.0 0.1  # Cu melts at 1358K — allow higher
+
+print ">>> PLUNGE PHASE — W tool rotating + moving DOWN into Cu plate <<<"
+print ">>> Shoulder: z=110→100  |  Pin tip: z=45→35 (crosses Al-Cu interface) <<<"
+run            50000    # 50 ps → 10 Å plunge
+
+unfix          tool_motion
+unfix          nvt_Al_plunge
+unfix          nvt_Cu_plunge
+
+write_dump     all xyz step4_plunge_done.xyz modify element Al Cu W
+
+
+# ------------------- 13) DWELL PHASE -------------------
+# Rotation only — pin stirring across Al-Cu faying surface → intermixing
+
+variable  vz_tool atom  0.0    # no axial motion during dwell
+
+fix   tool_dwell Tool move variable v_vx_tool v_vy_tool v_vz_tool NULL NULL NULL
+
+# Hold both at elevated temperature — allow Al-Cu mixing at faying surface
+fix   nvt_Al_dwell thermo_Al nvt temp 700.0 700.0 0.1
+fix   nvt_Cu_dwell thermo_Cu nvt temp 900.0 900.0 0.1
+
+print ">>> DWELL PHASE — rotation only, Al-Cu mixing at faying surface <<<"
+run            150000   # 150 ps
+
+unfix          tool_dwell
+unfix          nvt_Al_dwell
+unfix          nvt_Cu_dwell
+
+write_dump     all xyz step5_dwell_done.xyz modify element Al Cu W
+
+
+# ------------------- 14) RETRACT PHASE -------------------
+# Tool moves UP 10 Å, system begins to cool
+
+variable  vz_tool atom  0.2    # upward
+
+fix   tool_retract Tool move variable v_vx_tool v_vy_tool v_vz_tool NULL NULL NULL
+fix   nvt_Al_cool  thermo_Al nvt temp 700.0 300.0 0.1
+fix   nvt_Cu_cool  thermo_Cu nvt temp 900.0 300.0 0.1
+
+print ">>> RETRACT PHASE — tool moving UP, Al-Cu weld zone solidifying <<<"
+run            50000    # 50 ps
+
+unfix          tool_retract
+unfix          nvt_Al_cool
+unfix          nvt_Cu_cool
+
+write_dump     all xyz step6_retract_done.xyz modify element Al Cu W
+
+
+# ------------------- 15) COOLING PHASE -------------------
+# Both plates cool to 300 K — final Al-Cu bonded microstructure forms
+
+fix   cool_Al thermo_Al nvt temp 300.0 300.0 0.1
+fix   cool_Cu thermo_Cu nvt temp 300.0 300.0 0.1
+
+print ">>> COOLING PHASE — Al-Cu weld nugget relaxing to 300K <<<"
+run            100000   # 100 ps
+
+unfix          cool_Al
+unfix          cool_Cu
+
+undump         prod_dump
+write_dump     all xyz step7_final.xyz modify element Al Cu W
+
+
+# ------------------- 16) FINAL OUTPUT -------------------
+write_restart  fssw_AlCu_final.restart
+write_data     fssw_AlCu_final.data
+
+print " "
+print "================================================================"
+print "MULTIMATERIAL FSSW SIMULATION COMPLETE (Al-Cu LAP JOINT)"
+print "----------------------------------------------------------------"
+print "MATERIAL SUMMARY:"
+print "  Bottom plate: Al  (FCC a=4.05 Ang, type 1)"
+print "  Top plate:    Cu  (FCC a=3.615 Ang, type 2)"
+print "  Tool:         W   (BCC a=3.16 Ang,  type 3)"
+print "  Potential:    CuAlW EAM/alloy (Al-Cu-W cross-terms active)"
+print "----------------------------------------------------------------"
+print "TOOL MOTION SUMMARY:"
+print "  Start:   Shoulder z=110-120, Pin tip z=45 (above Cu surface)"
+print "  Plunge:  Shoulder z=100-110, Pin tip z=35 (pin crosses Al-Cu interface)"
+print "  Dwell:   Rotation only — Al-Cu intermixing at faying surface"
+print "  Retract: Tool moves up 10 Ang, weld nugget solidifies"
+print "  Cool:    Both plates relax to 300K"
+print "----------------------------------------------------------------"
+print "OUTPUT FILES:"
+print "  diagnostic.lammpstrj          equilibration (100-step frames)"
+print "  fssw_AlCu_production.lammpstrj plunge+dwell+retract (500-step frames)"
+print "  step0_with_tool.xyz           initial geometry"
+print "  step1_overlap_removed.xyz     after Al-Cu interface overlap removal"
+print "  step2_minimized.xyz           after CG minimization"
+print "  step3_equilibrated.xyz        Al and Cu both at 300K"
+print "  step4_plunge_done.xyz         after plunge into Cu"
+print "  step5_dwell_done.xyz          after dwell (Al-Cu mixed)"
+print "  step6_retract_done.xyz        after retract"
+print "  step7_final.xyz               final bonded Al-Cu structure"
+print "  fssw_AlCu_final.restart       binary restart"
+print "  fssw_AlCu_final.data          final atom data"
+print "================================================================"
